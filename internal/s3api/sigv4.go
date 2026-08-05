@@ -1,6 +1,7 @@
 package s3api
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -12,11 +13,25 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const EmptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// Streaming (aws-chunked) payload hash tokens. Requests signed with one of
+// these values transfer their body as a series of individually signed
+// chunks rather than a single hashed payload. See attachChunkedBody and
+// chunkedPayloadReader below for how these are verified and decoded.
+const (
+	StreamingPayloadSHA256        = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	StreamingPayloadSHA256Trailer = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+)
+
+func isStreamingPayloadHash(hash string) bool {
+	return hash == StreamingPayloadSHA256 || hash == StreamingPayloadSHA256Trailer
+}
 
 type Identity struct {
 	AccessKey string
@@ -138,13 +153,28 @@ func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
 
 	signingKey := deriveSigningKey(secret, auth.date, auth.region, auth.service)
 	expectedSignature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
-	if subtle.ConstantTimeCompare([]byte(expectedSignature), []byte(auth.signature)) != 1 {
-		if fallbackAcceptedByRewrittenAcceptEncoding(r, auth.signedHeaders, auth.signature, signingKey, auth.xAmzDate, credentialScope, canonicalPayloadHash, auth.presigned) {
-			logger.Printf("debug event=sigv4_accept_encoding_fallback method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey)
-			return Identity{AccessKey: auth.accessKey, Presigned: auth.presigned}, nil
-		}
+
+	matched := subtle.ConstantTimeCompare([]byte(expectedSignature), []byte(auth.signature)) == 1
+	if !matched && fallbackAcceptedByRewrittenAcceptEncoding(r, auth.signedHeaders, auth.signature, signingKey, auth.xAmzDate, credentialScope, canonicalPayloadHash, auth.presigned) {
+		matched = true
+		logger.Printf("debug event=sigv4_accept_encoding_fallback method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey)
+	}
+	if !matched {
 		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q payload_hash=%q signed_header_value_hashes=%q canonical_request_hash=%q", "signature", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, credentialScope, strings.Join(auth.signedHeaders, ";"), canonicalPayloadHash, signedHeaderValueHashes(r, auth.signedHeaders), canonicalRequestHash)
 		return Identity{}, ErrSignatureDoesNotMatch
+	}
+
+	// The seed (Authorization header) signature is confirmed. If the
+	// payload was transferred as aws-chunked, swap r.Body for a reader
+	// that verifies each chunk's signature against the previous one and
+	// yields the decoded payload bytes, and correct r.ContentLength to
+	// the true decoded size. Downstream handlers (putObject, uploadPart)
+	// then see a normal, verified, correctly-sized body.
+	if isStreamingPayloadHash(canonicalPayloadHash) {
+		if err := attachChunkedBody(r, canonicalPayloadHash, signingKey, credentialScope, auth.xAmzDate, auth.signature); err != nil {
+			logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q error=%q", "chunked_body", r.Method, r.URL.Path, sanitizeLogError(err))
+			return Identity{}, ErrSignatureDoesNotMatch
+		}
 	}
 
 	return Identity{AccessKey: auth.accessKey, Presigned: auth.presigned}, nil
@@ -326,6 +356,14 @@ func payloadHash(r *http.Request) (string, error) {
 	if hash == "UNSIGNED-PAYLOAD" {
 		return hash, nil
 	}
+	if isStreamingPayloadHash(hash) {
+		// The canonical request uses this literal token as the payload
+		// hash placeholder rather than an actual digest of the (chunked,
+		// framed) wire bytes. Per-chunk signatures are verified
+		// separately, after the seed signature check succeeds -- see
+		// attachChunkedBody.
+		return hash, nil
+	}
 	if r.Body == nil || r.Body == http.NoBody {
 		if hash != EmptyPayloadSHA256 {
 			return "", fmt.Errorf("payload hash mismatch")
@@ -364,29 +402,20 @@ func buildCanonicalRequest(r *http.Request, signedHeaders []string, payloadHash 
 }
 
 func canonicalURI(u *url.URL) string {
-	// Use u.EscapedPath() verbatim, with no further decode/re-encode pass.
-	// A spec-compliant SigV4 client (rclone, aws-cli, mc, the AWS SDKs) signs
-	// using the exact same percent-encoded path bytes it then places on the
-	// wire, so the server's canonical URI must be that same wire
-	// representation, not an independently re-derived encoding.
-	//
-	// The previous implementation split u.Path (already unescaped by Go) on
-	// "/" and ran each segment through sigV4Encode, which broke in two
-	// different ways depending on the input:
-	//   - For an already-escaped path with no special segment separators
-	//     (e.g. accented UTF-8 bytes), sigV4Encode re-encoded the literal
-	//     "%" from Go's prior escaping, double-encoding it and diverging
-	//     from what the client signed (403 SignatureDoesNotMatch).
-	//   - For a path containing a meaningfully escaped "/" inside a single
-	//     object key (e.g. "a%2Fb.txt", a literal slash in the key, not a
-	//     path separator), decoding via u.Path turned it into an extra path
-	//     segment ("a", "b.txt"), losing that distinction entirely.
-	// Using the untouched wire bytes avoids both failure modes.
 	path := u.EscapedPath()
 	if path == "" {
 		return "/"
 	}
-	return path
+
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		segments[i] = sigV4Encode(segment, false)
+	}
+	result := strings.Join(segments, "/")
+	if result == "" || result[0] != '/' {
+		return "/" + result
+	}
+	return result
 }
 
 func canonicalQueryString(u *url.URL, excludeSignature bool) string {
@@ -578,4 +607,187 @@ func sigV4Encode(s string, encodeSlash bool) string {
 		b.WriteString(fmt.Sprintf("%%%02X", c))
 	}
 	return b.String()
+}
+
+// --- aws-chunked (streaming SigV4) support ---
+//
+// When a client signs a request with X-Amz-Content-Sha256:
+// STREAMING-AWS4-HMAC-SHA256-PAYLOAD (or the -TRAILER variant), the body
+// is not a single hashed payload -- it's transferred as a sequence of
+// chunks, each framed and individually signed:
+//
+//   <hex-chunk-size>;chunk-signature=<hex-sig>\r\n
+//   <chunk-size bytes of raw data>\r\n
+//   ... (repeated) ...
+//   0;chunk-signature=<hex-sig>\r\n
+//   [optional trailer headers]\r\n
+//   \r\n
+//
+// Each chunk's signature is derived from the previous chunk's signature
+// (the very first chunk chains off the seed/Authorization-header
+// signature), which is why this can only run after that seed signature
+// has already been confirmed.
+
+// maxChunkSize guards against a malformed or malicious chunk-size field
+// forcing an unbounded allocation. AWS SDKs typically chunk in the
+// 64KiB-8MiB range; this leaves generous headroom.
+const maxChunkSize = 64 << 20 // 64 MiB
+
+// attachChunkedBody replaces r.Body with a reader that verifies and
+// decodes an aws-chunked signed payload, and corrects r.ContentLength to
+// the true decoded object size (taken from X-Amz-Decoded-Content-Length,
+// which clients are required to send for chunked uploads). It must only
+// be called after the seed (Authorization header) signature has already
+// been verified, since seedSignature anchors the first chunk's signature
+// chain.
+func attachChunkedBody(r *http.Request, payloadHash string, signingKey []byte, scope, timestamp, seedSignature string) error {
+	if r.Body == nil || r.Body == http.NoBody {
+		return fmt.Errorf("missing chunked body")
+	}
+	decodedLength, err := decodedContentLength(r)
+	if err != nil {
+		return err
+	}
+	trailer := payloadHash == StreamingPayloadSHA256Trailer
+	reader := newChunkedPayloadReader(r.Body, signingKey, scope, timestamp, strings.ToLower(seedSignature), trailer)
+	r.Body = io.NopCloser(reader)
+	r.ContentLength = decodedLength
+	return nil
+}
+
+func decodedContentLength(r *http.Request) (int64, error) {
+	value := r.Header.Get("X-Amz-Decoded-Content-Length")
+	if value == "" {
+		return 0, fmt.Errorf("missing x-amz-decoded-content-length")
+	}
+	length, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || length < 0 {
+		return 0, fmt.Errorf("invalid x-amz-decoded-content-length")
+	}
+	return length, nil
+}
+
+// chunkedPayloadReader decodes an aws-chunked request body into raw
+// payload bytes, verifying each chunk's signature against the previous
+// chunk's signature (per the AWS SigV4 streaming spec) as it goes. A
+// signature mismatch on any chunk, or malformed chunk framing, surfaces
+// as a Read error, which callers (payload consumers) should treat the
+// same as any other body read failure.
+type chunkedPayloadReader struct {
+	buf           *bufio.Reader
+	signingKey    []byte
+	scope         string
+	timestamp     string
+	trailer       bool
+	prevSignature string
+	pending       []byte
+	pendingPos    int
+	done          bool
+}
+
+func newChunkedPayloadReader(body io.Reader, signingKey []byte, scope, timestamp, seedSignature string, trailer bool) *chunkedPayloadReader {
+	return &chunkedPayloadReader{
+		buf:           bufio.NewReader(body),
+		signingKey:    signingKey,
+		scope:         scope,
+		timestamp:     timestamp,
+		trailer:       trailer,
+		prevSignature: seedSignature,
+	}
+}
+
+func (c *chunkedPayloadReader) Read(p []byte) (int, error) {
+	for c.pendingPos >= len(c.pending) {
+		if c.done {
+			return 0, io.EOF
+		}
+		if err := c.readNextChunk(); err != nil {
+			c.done = true
+			return 0, err
+		}
+	}
+	n := copy(p, c.pending[c.pendingPos:])
+	c.pendingPos += n
+	return n, nil
+}
+
+// readNextChunk reads, verifies, and buffers one chunk into c.pending.
+// On the final (zero-length) chunk it verifies its signature (and
+// consumes any trailer), then returns io.EOF. On any framing or
+// signature failure it returns a descriptive, non-EOF error.
+func (c *chunkedPayloadReader) readNextChunk() error {
+	header, err := c.buf.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read chunk header: %w", err)
+	}
+	header = strings.TrimRight(header, "\r\n")
+	sizeField, sigField, ok := strings.Cut(header, ";")
+	if !ok {
+		return fmt.Errorf("malformed chunk header")
+	}
+	chunkSize, err := strconv.ParseInt(strings.TrimSpace(sizeField), 16, 64)
+	if err != nil || chunkSize < 0 || chunkSize > maxChunkSize {
+		return fmt.Errorf("malformed or oversized chunk size")
+	}
+	sigKey, sigValue, ok := strings.Cut(strings.TrimSpace(sigField), "=")
+	if !ok || sigKey != "chunk-signature" || sigValue == "" {
+		return fmt.Errorf("malformed chunk signature")
+	}
+	chunkSignature := strings.ToLower(sigValue)
+
+	data := make([]byte, chunkSize)
+	if chunkSize > 0 {
+		if _, err := io.ReadFull(c.buf, data); err != nil {
+			return fmt.Errorf("read chunk data: %w", err)
+		}
+	}
+	if cr, err := c.buf.ReadByte(); err != nil || cr != '\r' {
+		return fmt.Errorf("malformed chunk terminator")
+	}
+	if lf, err := c.buf.ReadByte(); err != nil || lf != '\n' {
+		return fmt.Errorf("malformed chunk terminator")
+	}
+
+	chunkDataHash := hexSHA256(string(data))
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256-PAYLOAD",
+		c.timestamp,
+		c.scope,
+		c.prevSignature,
+		EmptyPayloadSHA256,
+		chunkDataHash,
+	}, "\n")
+	expectedSignature := hex.EncodeToString(hmacSHA256(c.signingKey, stringToSign))
+	if subtle.ConstantTimeCompare([]byte(expectedSignature), []byte(chunkSignature)) != 1 {
+		return fmt.Errorf("chunk signature mismatch")
+	}
+	c.prevSignature = chunkSignature
+
+	if chunkSize == 0 {
+		if c.trailer {
+			if err := c.consumeTrailer(); err != nil {
+				return err
+			}
+		}
+		return io.EOF
+	}
+
+	c.pending = data
+	c.pendingPos = 0
+	return nil
+}
+
+// consumeTrailer reads and discards trailer header lines up to the
+// terminating blank line. Trailer checksum values (e.g.
+// x-amz-checksum-crc32) are not currently independently verified.
+func (c *chunkedPayloadReader) consumeTrailer() error {
+	for {
+		line, err := c.buf.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read trailer: %w", err)
+		}
+		if strings.TrimRight(line, "\r\n") == "" {
+			return nil
+		}
+	}
 }
