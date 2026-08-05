@@ -22,8 +22,9 @@ const EmptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 
 // Streaming (aws-chunked) payload hash tokens. Requests signed with one of
 // these values transfer their body as a series of individually signed
-// chunks rather than a single hashed payload. See attachChunkedBody and
-// chunkedPayloadReader below for how these are verified and decoded.
+// chunks rather than a single hashed payload (used by minio-go-based
+// clients such as Kopia). See attachChunkedBody and chunkedPayloadReader
+// below for how these are verified and decoded.
 const (
 	StreamingPayloadSHA256        = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
 	StreamingPayloadSHA256Trailer = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
@@ -408,11 +409,11 @@ func canonicalURI(u *url.URL) string {
 	// wire, so the server's canonical URI must be that same wire
 	// representation, not an independently re-derived encoding.
 	//
-	// The previous implementation split u.Path (already unescaped by Go) on
-	// "/" and ran each segment through sigV4Encode, which broke in two
+	// A prior implementation split u.Path (already unescaped by Go) on
+	// "/" and ran each segment through a re-encoder, which broke in two
 	// different ways depending on the input:
 	//   - For an already-escaped path with no special segment separators
-	//     (e.g. accented UTF-8 bytes), sigV4Encode re-encoded the literal
+	//     (e.g. accented UTF-8 bytes), the re-encoder re-encoded the literal
 	//     "%" from Go's prior escaping, double-encoding it and diverging
 	//     from what the client signed (403 SignatureDoesNotMatch).
 	//   - For a path containing a meaningfully escaped "/" inside a single
