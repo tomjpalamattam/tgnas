@@ -29,6 +29,13 @@ var (
 type ObjectStore interface {
 	PutObject(ctx context.Context, input store.PutObjectInput) (store.PutObjectResult, error)
 	GetObject(ctx context.Context, input store.GetObjectInput) (io.ReadCloser, store.ObjectInfo, error)
+	// DeleteObject removes an object's metadata AND its underlying
+	// Telegram message(s). WebDAV deletes must route through this
+	// (rather than fs.meta.DeleteObject/DeletePrefix directly) so they
+	// get the same real Telegram cleanup that S3 DeleteObject does --
+	// previously WebDAV deletes only ever cleared metadata rows and left
+	// every deleted file's Telegram message orphaned forever.
+	DeleteObject(ctx context.Context, bucket, key string) error
 }
 
 type FileSystem struct {
@@ -183,39 +190,57 @@ func (fs *FileSystem) RemoveAll(ctx context.Context, name string) error {
 		return webdav.ErrForbidden
 	}
 	if strings.HasSuffix(key, "/") {
-		prefix := canonicalCollectionKey(key)
-		count, err := fs.meta.CountObjects(ctx, bucket, prefix)
-		if err != nil {
-			return err
-		}
-		if count == 0 {
-			return ErrNotFound
-		}
-		if count > maxRecursiveObjects {
-			return fmt.Errorf("recursive delete exceeds %d object limit", maxRecursiveObjects)
-		}
-		return fs.meta.DeletePrefix(ctx, bucket, prefix)
+		return fs.removeAllUnderPrefix(ctx, bucket, canonicalCollectionKey(key))
 	}
 	if _, err := fs.meta.HeadObject(ctx, bucket, key); err == nil {
-		return fs.meta.DeleteObject(ctx, bucket, key)
+		// Route through the ObjectStore, not fs.meta directly, so the
+		// object's Telegram message(s) actually get deleted too -- see
+		// the ObjectStore interface doc comment above.
+		return fs.objectStore.DeleteObject(ctx, bucket, key)
 	} else if !errors.Is(err, metadata.ErrNotFound) {
 		return err
 	}
 	if fs.collectionExists(ctx, bucket, canonicalCollectionKey(key)) {
-		prefix := canonicalCollectionKey(key)
-		count, err := fs.meta.CountObjects(ctx, bucket, prefix)
-		if err != nil {
-			return err
-		}
-		if count == 0 {
-			return ErrNotFound
-		}
-		if count > maxRecursiveObjects {
-			return fmt.Errorf("recursive delete exceeds %d object limit", maxRecursiveObjects)
-		}
-		return fs.meta.DeletePrefix(ctx, bucket, prefix)
+		return fs.removeAllUnderPrefix(ctx, bucket, canonicalCollectionKey(key))
 	}
 	return ErrNotFound
+}
+
+// removeAllUnderPrefix recursively deletes every object under prefix by
+// calling fs.objectStore.DeleteObject on each key individually, rather
+// than a single bulk fs.meta.DeletePrefix call. Telegram message deletion
+// is inherently per-object, so there's no way to batch this the way the
+// metadata-only path could -- but it means each deleted file's Telegram
+// message is actually cleaned up, matching what S3 DeleteObject already
+// does, instead of leaving every file in a WebDAV-deleted folder orphaned
+// in the source Telegram chat forever.
+//
+// Note this makes a recursive delete non-atomic: if DeleteObject hits a
+// genuine, non-tolerated error partway through (deleteChunkMessage already
+// tolerates "already gone" and Telegram's ~48h delete-age limit
+// internally), objects deleted so far stay deleted and the error is
+// returned immediately, leaving the rest of the folder in place.
+func (fs *FileSystem) removeAllUnderPrefix(ctx context.Context, bucket, prefix string) error {
+	count, err := fs.meta.CountObjects(ctx, bucket, prefix)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrNotFound
+	}
+	if count > maxRecursiveObjects {
+		return fmt.Errorf("recursive delete exceeds %d object limit", maxRecursiveObjects)
+	}
+	objects, err := fs.meta.ListAllObjects(ctx, bucket, prefix)
+	if err != nil {
+		return err
+	}
+	for _, object := range objects {
+		if err := fs.objectStore.DeleteObject(ctx, bucket, object.Key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (fs *FileSystem) Rename(ctx context.Context, oldName, newName string) error {
