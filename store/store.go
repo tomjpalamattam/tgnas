@@ -39,6 +39,7 @@ type ObjectStore struct {
 	uploadGates        map[string]*uploadGate
 	multipartMu        sync.Mutex
 	multipartUploads   map[string]*multipartUpload
+	multipartSeq       uint64
 	unavailableMu      sync.RWMutex
 	unavailableBuckets map[string]bool
 }
@@ -67,6 +68,7 @@ type multipartUpload struct {
 	key         string
 	contentType string
 	createdAt   time.Time
+	seq         uint64
 	parts       map[int]multipartPart
 }
 
@@ -293,11 +295,13 @@ func (s *ObjectStore) CreateMultipartUpload(ctx context.Context, input CreateMul
 
 	s.multipartMu.Lock()
 	defer s.multipartMu.Unlock()
+	s.multipartSeq++
 	s.multipartUploads[uploadID] = &multipartUpload{
 		bucket:      input.Bucket,
 		key:         input.Key,
 		contentType: input.ContentType,
 		createdAt:   time.Now().UTC(),
+		seq:         s.multipartSeq,
 		parts:       map[int]multipartPart{},
 	}
 	s.evictOldestMultipartUploadLocked()
@@ -317,11 +321,11 @@ func (s *ObjectStore) evictOldestMultipartUploadLocked() {
 		return
 	}
 	oldestID := ""
-	var oldest time.Time
+	var oldestSeq uint64
 	for uploadID, upload := range s.multipartUploads {
-		if oldestID == "" || upload.createdAt.Before(oldest) {
+		if oldestID == "" || upload.seq < oldestSeq {
 			oldestID = uploadID
-			oldest = upload.createdAt
+			oldestSeq = upload.seq
 		}
 	}
 	if oldestID != "" {

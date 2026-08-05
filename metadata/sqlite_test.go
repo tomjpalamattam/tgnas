@@ -7,9 +7,23 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"runtime"
 	"testing"
 	"time"
 )
+
+func TestSQLiteReadOnlyDSN(t *testing.T) {
+	path := "/tmp/metadata.sqlite"
+	want := "file:///tmp/metadata.sqlite?mode=ro"
+	if runtime.GOOS == "windows" {
+		path = `C:\Users\test\metadata.sqlite`
+		want = "file:///C:/Users/test/metadata.sqlite?mode=ro"
+	}
+
+	if got := sqliteReadOnlyDSN(path); got != want {
+		t.Fatalf("sqliteReadOnlyDSN(%q) = %q, want %q", path, got, want)
+	}
+}
 
 func TestSQLiteBucketsObjectsAndChunks(t *testing.T) {
 	store := openTestSQLiteStore(t)

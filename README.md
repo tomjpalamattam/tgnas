@@ -31,7 +31,7 @@ Common environment variables:
 
 - `TGNAS_LISTEN` overrides `server.listen` when `server.listen_env` is configured. Default is `:9000`.
 - `TGNAS_SECRET_KEY` is the example S3/WebDAV credential secret.
-- `TGNAS_TELEGRAM_BOT_TOKEN` provides the Telegram bot token in the default Docker-oriented config.
+- `TGNAS_TELEGRAM_BOT_TOKEN` provides the Telegram bot token.
 - `TGNAS_TELEGRAM_CHAT_ID` is the default bucket chat ID reference.
 - `TGNAS_SQLITE_PATH` can override the metadata SQLite path.
 
@@ -41,10 +41,35 @@ Bucket-level public read can be enabled for anonymous S3 object downloads:
 buckets:
   public-files:
     chat_id: "${TGNAS_TELEGRAM_CHAT_ID}"
+    bot_token: "${TGNAS_XXXX_BOT_TOKEN}" # (Optional)
     public_read: true
 ```
 
 `public_read` defaults to `false`. When enabled, anonymous S3 clients may only `GET` and `HEAD` objects in that bucket when they already know the object key. Bucket listing, root bucket listing, writes, deletes, and WebDAV still require authentication.
+
+### S3 CORS
+
+Browser access to the S3 API can be enabled globally with `server.allowed_origins` and overridden for individual buckets:
+
+```yaml
+server:
+  allowed_origins:
+    - "https://frontend.example.com"
+    - "https://*.example.com"
+    - '/^https://[a-z]+\.internal\.example$/'
+
+buckets:
+  photos:
+    chat_id: "${TGNAS_TELEGRAM_CHAT_ID}"
+    allowed_origins:
+      - "https://photos.example.com"
+```
+
+Origin rules are case-insensitive and support exact values, `*` globs, and Go RE2 regular expressions wrapped in `/.../`. A non-empty bucket list replaces the global list. A missing, empty, or empty-string-only bucket list falls back to `server.allowed_origins`.
+
+CORS is opt-in: when the effective origin list is empty, TgNAS preserves its existing S3 response and `OPTIONS` behavior. CORS applies only to the S3 API; WebDAV, `/healthz`, and `/readyz` are not decorated or short-circuited by the S3 CORS policy. CORS does not bypass SigV4 or `public_read` authentication rules.
+
+Successful preflights allow `GET`, `HEAD`, `PUT`, `POST`, `DELETE`, and `OPTIONS`; accept `Authorization`, `Content-Type`, `Range`, `X-Amz-Date`, and `X-Amz-Content-Sha256`; and use a max age of 3600 seconds. Actual allowed-origin responses expose `ETag`, `Content-Range`, `Content-Length`, `Accept-Ranges`, and `Last-Modified`. TgNAS never emits `Access-Control-Allow-Credentials`.
 
 Trusted proxy configuration for reverse proxies (e.g. cloudflared, nginx):
 
