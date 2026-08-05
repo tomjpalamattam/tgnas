@@ -402,20 +402,29 @@ func buildCanonicalRequest(r *http.Request, signedHeaders []string, payloadHash 
 }
 
 func canonicalURI(u *url.URL) string {
+	// Use u.EscapedPath() verbatim, with no further decode/re-encode pass.
+	// A spec-compliant SigV4 client (rclone, aws-cli, mc, the AWS SDKs) signs
+	// using the exact same percent-encoded path bytes it then places on the
+	// wire, so the server's canonical URI must be that same wire
+	// representation, not an independently re-derived encoding.
+	//
+	// The previous implementation split u.Path (already unescaped by Go) on
+	// "/" and ran each segment through sigV4Encode, which broke in two
+	// different ways depending on the input:
+	//   - For an already-escaped path with no special segment separators
+	//     (e.g. accented UTF-8 bytes), sigV4Encode re-encoded the literal
+	//     "%" from Go's prior escaping, double-encoding it and diverging
+	//     from what the client signed (403 SignatureDoesNotMatch).
+	//   - For a path containing a meaningfully escaped "/" inside a single
+	//     object key (e.g. "a%2Fb.txt", a literal slash in the key, not a
+	//     path separator), decoding via u.Path turned it into an extra path
+	//     segment ("a", "b.txt"), losing that distinction entirely.
+	// Using the untouched wire bytes avoids both failure modes.
 	path := u.EscapedPath()
 	if path == "" {
 		return "/"
 	}
-
-	segments := strings.Split(path, "/")
-	for i, segment := range segments {
-		segments[i] = sigV4Encode(segment, false)
-	}
-	result := strings.Join(segments, "/")
-	if result == "" || result[0] != '/' {
-		return "/" + result
-	}
-	return result
+	return path
 }
 
 func canonicalQueryString(u *url.URL, excludeSignature bool) string {
