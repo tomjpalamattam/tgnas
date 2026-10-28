@@ -40,6 +40,11 @@ func (s fakeObjectStore) GetObject(ctx context.Context, input store.GetObjectInp
 	return io.NopCloser(strings.NewReader(value)), info, nil
 }
 
+func (s fakeObjectStore) DeleteObject(ctx context.Context, bucket, key string) error {
+	delete(s.objects, bucket+"/"+key)
+	return nil
+}
+
 func openTestFS(t *testing.T) (*FileSystem, metadata.Store, fakeObjectStore) {
 	t.Helper()
 	meta, err := metadata.OpenSQLite(t.TempDir() + "/metadata.sqlite")
