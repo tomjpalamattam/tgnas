@@ -664,14 +664,16 @@ func uploadedFileFromResult(fileType string, result uploadResult) (UploadedFile,
 		}
 		// Telegram can reclassify a document upload into a different
 		// response field even when sendDocument was the API called to
-		// upload it — observed in production for certain mp4 videos, where
-		// the response's "document" field was empty but "video" was
-		// populated. Fall back to whichever field Telegram actually filled
+		// upload it. Known cases: .webp files come back as a "sticker"
+		// message (webp is Telegram's sticker format), and certain mp4
+		// videos come back with an empty "document" but a populated
+		// "video". Fall back to whichever field Telegram actually filled
 		// in rather than failing an upload that genuinely succeeded.
 		for _, fallback := range [...]struct {
 			name  string
 			media telegramFile
 		}{
+			{"sticker", result.Sticker},
 			{"video", result.Video},
 			{"animation", result.Animation},
 			{"audio", result.Audio},
@@ -680,7 +682,7 @@ func uploadedFileFromResult(fileType string, result uploadResult) (UploadedFile,
 				return mediaToUploadedFile(fallback.name, fallback.media)
 			}
 		}
-		return UploadedFile{}, errors.New("telegram upload response missing document")
+		return UploadedFile{}, errors.New("telegram upload response missing document or sticker")
 	default:
 		return UploadedFile{}, fmt.Errorf("unsupported telegram upload type %q", fileType)
 	}
@@ -707,6 +709,7 @@ type uploadEnvelope struct {
 type uploadResult struct {
 	MessageID int64          `json:"message_id"`
 	Document  telegramFile   `json:"document"`
+	Sticker   telegramFile   `json:"sticker"`
 	Video     telegramFile   `json:"video"`
 	Audio     telegramFile   `json:"audio"`
 	Animation telegramFile   `json:"animation"`
