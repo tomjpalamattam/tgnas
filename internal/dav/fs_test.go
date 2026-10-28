@@ -17,6 +17,7 @@ import (
 
 type fakeObjectStore struct {
 	objects map[string]string
+	meta    metadata.Store
 }
 
 func (s fakeObjectStore) PutObject(ctx context.Context, input store.PutObjectInput) (store.PutObjectResult, error) {
@@ -42,6 +43,9 @@ func (s fakeObjectStore) GetObject(ctx context.Context, input store.GetObjectInp
 
 func (s fakeObjectStore) DeleteObject(ctx context.Context, bucket, key string) error {
 	delete(s.objects, bucket+"/"+key)
+	if s.meta != nil {
+		return s.meta.DeleteObject(ctx, bucket, key)
+	}
 	return nil
 }
 
@@ -52,7 +56,7 @@ func openTestFS(t *testing.T) (*FileSystem, metadata.Store, fakeObjectStore) {
 		t.Fatalf("OpenSQLite returned error: %v", err)
 	}
 	t.Cleanup(func() { _ = meta.Close() })
-	objectStore := fakeObjectStore{objects: map[string]string{}}
+	objectStore := fakeObjectStore{objects: map[string]string{}, meta: meta}
 	return NewFileSystem(meta, objectStore), meta, objectStore
 }
 

@@ -75,8 +75,20 @@ func openSQLite(dataSourceName string) (*SQLiteStore, error) {
 // and retries internally instead of failing immediately with
 // SQLITE_BUSY). See OpenSQLite's SetMaxOpenConns(1) comment for the
 // production incident this pair of pragmas fixes.
+
+// sqliteFileURL builds a file: URI for an absolute filesystem path. On
+// Windows an absolute path looks like C:\dir\db.sqlite, which is not a
+// valid URI path; it has to become /C:/dir/db.sqlite so the result is
+// file:///C:/dir/db.sqlite.
+func sqliteFileURL(path string) url.URL {
+	if runtime.GOOS == "windows" {
+		path = "/" + filepath.ToSlash(path)
+	}
+	return url.URL{Scheme: "file", Path: path}
+}
+
 func sqliteReadWriteDSN(path string) string {
-	u := url.URL{Scheme: "file", Path: path}
+	u := sqliteFileURL(path)
 	query := u.Query()
 	query.Add("_pragma", "busy_timeout(10000)")
 	query.Add("_pragma", "journal_mode(WAL)")
@@ -85,11 +97,7 @@ func sqliteReadWriteDSN(path string) string {
 }
 
 func sqliteReadOnlyDSN(path string) string {
-	if runtime.GOOS == "windows" {
-		path = "/" + filepath.ToSlash(path)
-	}
-
-	u := url.URL{Scheme: "file", Path: path}
+	u := sqliteFileURL(path)
 	query := u.Query()
 	query.Set("mode", "ro")
 	u.RawQuery = query.Encode()
